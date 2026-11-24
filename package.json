@@ -1,0 +1,17 @@
+{
+  "name": "pair-up-product",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --experimental-sqlite src/server.js",
+    "dev": "STORAGE_MODE=memory node --experimental-sqlite --watch src/server.js",
+    "test": "node --experimental-sqlite --test test/*.test.js"
+  },
+  "devDependencies": {
+    "railway": "^3.17.0"
+  }
+}
