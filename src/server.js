@@ -6,7 +6,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from './store.js';
-import { newRoom, demoRoom, fixedDemoPairs, suggest, warnings, validateGroups } from './pairing.js';
+import { newRoom, demoRoom, fixedDemoPairs, suggest, warnings, checks, reason, validateGroups, SMALL_CLASS_MAX } from './pairing.js';
 
 const scryptAsync = promisify(scrypt);
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -81,8 +81,15 @@ export function createApp(options = {}) {
     if(!store.get().rooms[key]) { store.get().rooms[key]=demoRoom();store.save(); }
     return store.get().rooms[key];
   }
+  // Coach-only view: includes levels, coach notes, flags and the reason for each group.
   function roomView(room) {
-    return {...room,undo:undefined,canUndo:room.undo.length>0,groups:room.groups.map(g=>({ids:g,warnings:warnings(g,room.roster,room.round===2?room.firstGroups:[])}))};
+    const previous=room.round===2?room.firstGroups:[];
+    const placed=new Set(room.groups.flat());
+    return {
+      ...room,undo:undefined,canUndo:room.undo.length>0,smallClassMax:SMALL_CLASS_MAX,
+      unassigned:room.stage==='draft'?active(room).filter(p=>!placed.has(p.id)).map(p=>p.id):[],
+      groups:room.groups.map(g=>({ids:g,warnings:warnings(g,room.roster,previous),checks:checks(g,room.roster),reason:reason(g,room.roster)}))
+    };
   }
   function checkpoint(room) { room.undo.push({groups:structuredClone(room.groups),stage:room.stage,source:room.source}); if(room.undo.length>50)room.undo.shift(); }
   function changed(room) {room.revision++;store.save();}
@@ -147,6 +154,7 @@ export function createApp(options = {}) {
         const user=requireUser(req);user.profile=profile(body);store.save();return json({user:safeUser(user)});
       }
       if(path==='/api/checkin'&&req.method==='POST')return json(checkIn(requireUser(req),profile(body),body.skip));
+      // Members only ever see their own check-in and confirmed partner names: no levels, no coach notes.
       if(path==='/api/member/status'&&req.method==='GET') {
         const user=requireUser(req),room=store.get().rooms.live,entry=room.roster.find(p=>p.id===user.id);
         const group=room.stage==='confirmed'?room.groups.find(g=>g.includes(user.id)):null;
@@ -200,6 +208,18 @@ export function createApp(options = {}) {
           if(body.level!==undefined){if(![1,2,3].includes(body.level))fail(400,'Invalid level.');member.level=body.level;}
           if(body.present!==undefined)member.present=Boolean(body.present);
           if(body.skip!==undefined)member.skip=Boolean(body.skip);
+          // Coach notes: free text, a partner level the member needs, and one member to keep apart from.
+          if(body.note!==undefined){if(typeof body.note!=='string'||body.note.trim().length>80)fail(400,'Keep the coach note under 80 characters.');member.note=body.note.trim();}
+          if(body.needsLevel!==undefined){if(![0,1,2,3].includes(body.needsLevel))fail(400,'Invalid partner level.');member.needsLevel=body.needsLevel;}
+          if(body.apart!==undefined) {
+            if(typeof body.apart!=='string')fail(400,'Invalid member.');
+            room.roster.forEach(m=>{if(m.apart)m.apart=m.apart.filter(id=>id!==member.id);});
+            if(body.apart) {
+              const other=room.roster.find(m=>m.id===body.apart&&m.id!==member.id);
+              if(!other)fail(400,'Choose another member to keep apart from.');
+              member.apart=[other.id];
+            }else member.apart=[];
+          }
           room.groups=[];room.undo=[];room.stage='open';changed(room);return json(roomView(room));
         }
         if(path==='/api/coach/next-round') {
@@ -207,23 +227,66 @@ export function createApp(options = {}) {
           room.firstGroups=structuredClone(room.groups);room.round=2;room.stage='open';room.groups=[];room.undo=[];
           changed(room);return json(roomView(room));
         }
+        if(path==='/api/coach/roster') {
+          if(room.stage==='confirmed')fail(409,'This round is already confirmed.');
+          room.groups=[];room.undo=[];room.stage='open';room.source='automatic';changed(room);return json(roomView(room));
+        }
         if(path==='/api/coach/suggest') {
           if(room.stage==='confirmed')fail(409,'This round is already confirmed.');
           const members=active(room);if(members.length<2)fail(400,'Check in at least two members who want to pair.');
-          if(body.source==='fixed') {
+          const previous=room.round===2?room.firstGroups:[];
+          let groups,source;
+          if(body.source==='manual'){groups=[];source='manual';}
+          else if(body.source==='fixed') {
             if(!room.demo||room.round!==1||!validateGroups(fixedDemoPairs,members))fail(400,'Fixed pairs require the original Round 1 demo roster. Reset the demo to use them.');
-            checkpoint(room);
-            room.groups=structuredClone(fixedDemoPairs);room.source='fixed';
-          }else{checkpoint(room);room.groups=suggest(members,room.round===2?room.firstGroups:[],randomBytes(4).readUInt32LE());room.source='automatic';}
+            groups=structuredClone(fixedDemoPairs);source='fixed';
+          }else{
+            // keep:true pairs only the members who are not placed yet and leaves hand-placed groups alone.
+            const keep=body.keep===true&&room.stage==='draft'?room.groups.map(g=>[...g]):[];
+            try{groups=suggest(members,previous,randomBytes(4).readUInt32LE(),keep);}catch(error){fail(400,error.message);}
+            source=keep.length?'mixed':'automatic';
+          }
+          checkpoint(room);room.groups=groups;room.source=source;
           room.stage='draft';changed(room);return json(roomView(room));
+        }
+        if(path==='/api/coach/arrange') {
+          if(room.stage!=='draft')fail(409,'Open the pairing board first.');
+          const ids=body.ids,eligible=new Set(active(room).map(p=>p.id));
+          if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))fail(400,'Choose members first.');
+          const where=id=>room.groups.findIndex(g=>g.includes(id));
+          if(body.op==='pair') {
+            if(![2,3].includes(ids.length)||new Set(ids).size!==ids.length||ids.some(id=>!eligible.has(id)||where(id)>=0))fail(400,'Choose two or three members who are not paired yet.');
+            checkpoint(room);room.groups.push([...ids]);
+          }else if(body.op==='add') {
+            const gi=ids.length===2?where(ids[1]):-1;
+            if(gi<0||room.groups[gi].length!==2||!eligible.has(ids[0])||where(ids[0])>=0)fail(400,'Choose a member who is not paired yet and a pair to join.');
+            checkpoint(room);room.groups[gi].push(ids[0]);
+          }else if(body.op==='remove') {
+            const gi=ids.length===1?where(ids[0]):-1;
+            if(gi<0||room.groups[gi].length!==3)fail(400,'Only a member of a group of three can be removed this way.');
+            checkpoint(room);room.groups[gi]=room.groups[gi].filter(id=>id!==ids[0]);
+          }else if(body.op==='break') {
+            const gi=ids.length===1?where(ids[0]):-1;
+            if(gi<0)fail(400,'Choose a group to break up.');
+            checkpoint(room);room.groups.splice(gi,1);
+          }else fail(400,'Unknown action.');
+          changed(room);return json(roomView(room));
         }
         if(path==='/api/coach/swap') {
           if(room.stage!=='draft')fail(409,'Generate suggestions before swapping.');
           const a=room.groups.findIndex(g=>g.includes(body.a)),b=room.groups.findIndex(g=>g.includes(body.b));
-          if(a<0||b<0||a===b)fail(400,'Choose members from two different groups.');
-          checkpoint(room);
-          const i=room.groups[a].indexOf(body.a),j=room.groups[b].indexOf(body.b);
-          [room.groups[a][i],room.groups[b][j]]=[room.groups[b][j],room.groups[a][i]];
+          if(a>=0&&b>=0) {
+            if(a===b)fail(400,'Choose members from two different groups.');
+            checkpoint(room);
+            const i=room.groups[a].indexOf(body.a),j=room.groups[b].indexOf(body.b);
+            [room.groups[a][i],room.groups[b][j]]=[room.groups[b][j],room.groups[a][i]];
+          }else if(a>=0||b>=0) {
+            // One member is in a group and the other is not paired yet: replace the grouped one.
+            const [inId,outId]=a>=0?[body.b,body.a]:[body.a,body.b],gi=a>=0?a:b;
+            if(!active(room).some(p=>p.id===inId))fail(400,'That member is not available to pair.');
+            checkpoint(room);
+            room.groups[gi][room.groups[gi].indexOf(outId)]=inId;
+          }else fail(400,'Choose members from two different groups.');
           changed(room);return json(roomView(room));
         }
         if(path==='/api/coach/undo') {
@@ -231,7 +294,10 @@ export function createApp(options = {}) {
           Object.assign(room,room.undo.pop());changed(room);return json(roomView(room));
         }
         if(path==='/api/coach/confirm') {
-          if(room.stage!=='draft'||!validateGroups(room.groups,active(room)))fail(409,'Generate complete pairs before confirming.');
+          if(room.stage!=='draft')fail(409,'Generate complete pairs before confirming.');
+          const members=active(room),placed=new Set(room.groups.flat()),left=members.filter(p=>!placed.has(p.id)).length;
+          if(left)fail(409,`${left} ${left===1?'member still needs':'members still need'} a partner.`);
+          if(!validateGroups(room.groups,members))fail(409,'Use pairs only, plus exactly one group of three when the class is odd.');
           if(room.groups.some(g=>warnings(g,room.roster,room.round===2?room.firstGroups:[]).length)&&body.acceptWarnings!==true)fail(400,'Review the flagged pairs before confirming.');
           room.stage='confirmed';room.undo=[];room.confirmedAt=new Date().toISOString();changed(room);return json(roomView(room));
         }

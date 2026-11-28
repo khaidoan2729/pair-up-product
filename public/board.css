@@ -1,0 +1,21 @@
+/* Roster rows: Hour 2 rows are one big tap target; ··· stays separate. */
+.member-main{display:flex;align-items:center;gap:12px;flex:1;min-width:0;min-height:44px;margin:0;padding:0;border:0;background:transparent;color:var(--text);text-align:left;font:inherit}
+button.member-main{cursor:pointer;border-radius:8px}
+button.member-main:hover{background:#ffffff0a}
+.member-main .member-name{display:block;flex:1;min-width:0;font-size:14px;font-weight:550}
+.member-main .meta{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:3px}
+.note-line{display:block;font-size:11px;font-weight:400;color:var(--lavender);margin-top:3px}
+
+/* Pairing board */
+.actions.tight{margin-top:14px}
+.unpaired{margin-bottom:18px}
+.unpaired h2{font-size:17px}
+.pick-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:14px}
+.pick-grid .person{flex:none}
+.person .note-badge{color:#f0cb69}
+.pair-tools{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.pair-tools .btn.small{padding:6px 10px}
+.trio-why{font-size:11px;line-height:1.6;margin-top:10px}
+.why{font-size:11px;color:var(--muted);margin-top:9px}
+.check{font-size:11px;color:#c0cce4;margin-top:9px}
+.coach-note{font-size:11px;color:var(--lavender);margin-top:9px}
